@@ -1,3 +1,4 @@
+use crate::aio::ConnectionLike;
 use crate::cluster_async::ConnectionFuture;
 use crate::cluster_routing::{Route, SlotAddr};
 use crate::cluster_slotmap::{ReadFromReplicaStrategy, SlotMap, SlotMapValue};
@@ -37,7 +38,7 @@ pub struct ConnectionDetails<Connection> {
 
 impl<Connection> ConnectionDetails<Connection>
 where
-    Connection: Clone + Send + 'static,
+    Connection: ConnectionLike + Clone + Send + 'static,
 {
     /// Consumes the current instance and returns a new `ConnectionDetails`
     /// where the connection is wrapped in a future.
@@ -79,7 +80,7 @@ pub struct ClusterNode<Connection> {
 
 impl<Connection> ClusterNode<Connection>
 where
-    Connection: Clone,
+    Connection: ConnectionLike + Clone,
 {
     pub fn new(
         user_connection: ConnectionDetails<Connection>,
@@ -162,7 +163,7 @@ pub(crate) type ConnectionAndAddress<Connection> = (String, Connection);
 
 impl<Connection> ConnectionsContainer<Connection>
 where
-    Connection: Clone,
+    Connection: Clone + ConnectionLike,
 {
     pub(crate) fn new(
         slot_map: SlotMap,
@@ -263,7 +264,7 @@ where
             if let Some((address, connection_details)) =
                 self.connection_details_for_address(replica.as_str())
             {
-                if connection_details.az.as_deref() == Some(&client_az) {
+                if connection_details.conn.get_az() == Some(&client_az) {
                     // Attempt to update `latest_used_replica` with the index of this replica.
                     let _ = slot_map_value.latest_used_replica.compare_exchange_weak(
                         initial_index,
@@ -439,7 +440,7 @@ mod tests {
     use super::*;
     impl<Connection> ClusterNode<Connection>
     where
-        Connection: Clone,
+        Connection: ConnectionLike + Clone,
     {
         pub(crate) fn new_only_with_user_conn(user_connection: Connection) -> Self {
             let ip = None;

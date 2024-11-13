@@ -748,6 +748,10 @@ mod cluster_async {
         fn is_closed(&self) -> bool {
             true
         }
+
+        fn get_az(&self) -> Option<String> {
+            None
+        }
     }
 
     #[test]

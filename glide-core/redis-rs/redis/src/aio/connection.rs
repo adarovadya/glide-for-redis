@@ -260,6 +260,10 @@ where
         // always false for AsyncRead + AsyncWrite (cant do better)
         false
     }
+
+    fn get_az(&self) -> Option<&String> {
+        None
+    }
 }
 
 /// Represents a `PubSub` connection.

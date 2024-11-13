@@ -181,6 +181,11 @@ async fn connect_and_check_only_management_conn<C>(
 where
     C: ConnectionLike + Connect + Send + Sync + 'static + Clone,
 {
+    let discover_az = matches!(
+        params.read_from_replicas,
+        crate::cluster_slotmap::ReadFromReplicaStrategy::AZAffinity(_)
+    );
+
     match create_connection::<C>(
         addr,
         params.clone(),
@@ -189,6 +194,7 @@ where
         GlideConnectionOptions {
             push_sender: None,
             disconnect_notifier,
+            discover_az,
         },
     )
     .await

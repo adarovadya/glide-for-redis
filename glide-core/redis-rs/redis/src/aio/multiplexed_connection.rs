@@ -7,6 +7,9 @@ use crate::cmd::Cmd;
 use crate::parser::ValueCodec;
 use crate::push_manager::PushManager;
 use crate::types::{RedisError, RedisFuture, RedisResult, Value};
+use crate::ErrorKind;
+use crate::FromRedisValue;
+use crate::InfoDict;
 use crate::{cmd, ConnectionInfo, ProtocolVersion, PushKind};
 use ::tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -413,6 +416,7 @@ pub struct MultiplexedConnection {
     response_timeout: Duration,
     protocol: ProtocolVersion,
     push_manager: PushManager,
+    availability_zone: Option<String>,
 }
 
 impl Debug for MultiplexedConnection {
@@ -442,6 +446,28 @@ impl MultiplexedConnection {
             glide_connection_options,
         )
         .await
+    }
+
+    // Helper function to extract and update availability zone from INFO command
+    async fn update_az_from_info(con: &mut MultiplexedConnection) -> RedisResult<()> {
+        let info_res = con.req_packed_command(&cmd("INFO")).await;
+        match info_res {
+            Ok(value) => {
+                let info_dict: InfoDict = FromRedisValue::from_redis_value(&value)?;
+                if let Some(node_az) = info_dict.get::<String>("availability_zone") {
+                    con.availability_zone = Some(node_az);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // Handle the error case for the INFO command
+                Err(RedisError::from((
+                    ErrorKind::ResponseError,
+                    "Failed to execute INFO command. ",
+                    format!("{:?}", e),
+                )))
+            }
+        }
     }
 
     /// Constructs a new `MultiplexedConnection` out of a `AsyncRead + AsyncWrite` object
@@ -483,7 +509,13 @@ impl MultiplexedConnection {
             response_timeout,
             push_manager: pm,
             protocol: redis_connection_info.protocol,
+            availability_zone: None,
         };
+
+        if glide_connection_options.discover_az {
+            let _ = Self::update_az_from_info(&mut con);
+        }
+
         let driver = {
             let auth = setup_connection(&connection_info.redis, &mut con);
 
@@ -597,6 +629,10 @@ impl ConnectionLike for MultiplexedConnection {
 
     fn is_closed(&self) -> bool {
         self.pipeline.is_closed()
+    }
+
+    fn get_az(&self) -> Option<&String> {
+        self.availability_zone.as_ref()
     }
 }
 impl MultiplexedConnection {

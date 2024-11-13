@@ -292,6 +292,10 @@ impl AioConnectionLike for MockRedisConnection {
     fn is_closed(&self) -> bool {
         false
     }
+
+    fn get_az(&self) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(test)]

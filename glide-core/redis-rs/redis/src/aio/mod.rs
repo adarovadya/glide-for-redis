@@ -84,6 +84,9 @@ pub trait ConnectionLike {
 
     /// Returns the state of the connection
     fn is_closed(&self) -> bool;
+
+    /// Get the connection availibility zone
+    fn get_az(&self) -> Option<&String>;
 }
 
 /// Implements ability to notify about disconnection events

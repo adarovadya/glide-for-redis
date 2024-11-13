@@ -86,6 +86,8 @@ pub struct GlideConnectionOptions {
     #[cfg(feature = "aio")]
     /// Passive disconnect notifier
     pub disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
+    /// True if ReadFromReplica strategy is set to AzAffinity
+    pub discover_az: bool,
 }
 
 /// To enable async support you need to enable the feature: `tokio-comp`

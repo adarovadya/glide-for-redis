@@ -1029,9 +1029,15 @@ where
             None
         };
 
+        let discover_az = matches!(
+            cluster_params.read_from_replicas,
+            crate::cluster_slotmap::ReadFromReplicaStrategy::AZAffinity(_)
+        );
+
         let glide_connection_options = GlideConnectionOptions {
             push_sender,
             disconnect_notifier,
+            discover_az,
         };
 
         let connections = Self::create_initial_connections(
@@ -2571,6 +2577,10 @@ where
 
     fn is_closed(&self) -> bool {
         false
+    }
+
+    fn get_az(&self) -> Option<&String> {
+        None
     }
 }
 
