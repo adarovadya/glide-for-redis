@@ -647,6 +647,17 @@ export interface BaseClientConfiguration {
      * ```
      */
     clientAz?: string;
+    /**
+     * Configs for OpenTelemetry if exits.
+     */
+    openTelemetryConfigs?: {
+        collectorEndPoint: string;
+        /**
+         * The duration in milliseconds the data will export to the collector.
+         * If interval isn't supplied, 500 will be used
+         */
+        spanFlushInterval?: number;
+    }
 }
 
 /**
@@ -744,7 +755,6 @@ export class BaseClient {
     private readonly pubsubFutures: [PromiseFunction, ErrorFunction][] = [];
     private pendingPushNotification: response.Response[] = [];
     private readonly inflightRequestsLimit: number;
-    private readonly clientAz: string | undefined;
     private config: BaseClientConfiguration | undefined;
 
     protected configurePubsub(
