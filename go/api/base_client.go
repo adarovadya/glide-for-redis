@@ -5,10 +5,11 @@ package api
 // #cgo LDFLAGS: -lglide_rs
 // #cgo !windows LDFLAGS: -lm
 // #cgo darwin LDFLAGS: -framework Security
+// #cgo darwin,amd64 LDFLAGS: -framework CoreFoundation
 // #cgo linux,amd64 LDFLAGS: -L${SRCDIR}/../rustbin/x86_64-unknown-linux-gnu
 // #cgo linux,arm64 LDFLAGS: -L${SRCDIR}/../rustbin/aarch64-unknown-linux-gnu
 // #cgo darwin,arm64 LDFLAGS: -L${SRCDIR}/../rustbin/aarch64-apple-darwin
-// #cgo LDFLAGS: -L../target/release
+// #cgo darwin,amd64 LDFLAGS: -L${SRCDIR}/../rustbin/x86_64-apple-darwin
 // #include "../lib.h"
 //
 // void successCallback(void *channelPtr, struct CommandResponse *message);
@@ -54,7 +55,7 @@ type payload struct {
 //export successCallback
 func successCallback(channelPtr unsafe.Pointer, cResponse *C.struct_CommandResponse) {
 	response := cResponse
-	resultChannel := *(*chan payload)(channelPtr)
+	resultChannel := *(*chan payload)(getPinnedPtr(channelPtr))
 	resultChannel <- payload{value: response, error: nil}
 }
 
@@ -62,7 +63,7 @@ func successCallback(channelPtr unsafe.Pointer, cResponse *C.struct_CommandRespo
 func failureCallback(channelPtr unsafe.Pointer, cErrorMessage *C.char, cErrorType C.RequestErrorType) {
 	defer C.free_error_message(cErrorMessage)
 	msg := C.GoString(cErrorMessage)
-	resultChannel := *(*chan payload)(channelPtr)
+	resultChannel := *(*chan payload)(getPinnedPtr(channelPtr))
 	resultChannel <- payload{value: nil, error: errors.GoError(uint32(cErrorType), msg)}
 }
 
@@ -120,6 +121,80 @@ func (client *baseClient) executeCommand(requestType C.RequestType, args []strin
 	return client.executeCommandWithRoute(requestType, args, nil)
 }
 
+func slotTypeToProtobuf(slotType config.SlotType) (protobuf.SlotTypes, error) {
+	switch slotType {
+	case config.SlotTypePrimary:
+		return protobuf.SlotTypes_Primary, nil
+	case config.SlotTypeReplica:
+		return protobuf.SlotTypes_Replica, nil
+	default:
+		return protobuf.SlotTypes_Primary, &errors.RequestError{Msg: "Invalid slot type"}
+	}
+}
+
+func routeToProtobuf(route config.Route) (*protobuf.Routes, error) {
+	switch route := route.(type) {
+	case config.SimpleNodeRoute:
+		{
+			var simpleRoute protobuf.SimpleRoutes
+			switch route {
+			case config.AllNodes:
+				simpleRoute = protobuf.SimpleRoutes_AllNodes
+			case config.AllPrimaries:
+				simpleRoute = protobuf.SimpleRoutes_AllPrimaries
+			case config.RandomRoute:
+				simpleRoute = protobuf.SimpleRoutes_Random
+			default:
+				return nil, &errors.RequestError{Msg: "Invalid simple node route"}
+			}
+			return &protobuf.Routes{Value: &protobuf.Routes_SimpleRoutes{SimpleRoutes: simpleRoute}}, nil
+		}
+	case *config.SlotIdRoute:
+		{
+			slotType, err := slotTypeToProtobuf(route.SlotType)
+			if err != nil {
+				return nil, err
+			}
+			return &protobuf.Routes{
+				Value: &protobuf.Routes_SlotIdRoute{
+					SlotIdRoute: &protobuf.SlotIdRoute{
+						SlotType: slotType,
+						SlotId:   route.SlotID,
+					},
+				},
+			}, nil
+		}
+	case *config.SlotKeyRoute:
+		{
+			slotType, err := slotTypeToProtobuf(route.SlotType)
+			if err != nil {
+				return nil, err
+			}
+			return &protobuf.Routes{
+				Value: &protobuf.Routes_SlotKeyRoute{
+					SlotKeyRoute: &protobuf.SlotKeyRoute{
+						SlotType: slotType,
+						SlotKey:  route.SlotKey,
+					},
+				},
+			}, nil
+		}
+	case *config.ByAddressRoute:
+		{
+			return &protobuf.Routes{
+				Value: &protobuf.Routes_ByAddressRoute{
+					ByAddressRoute: &protobuf.ByAddressRoute{
+						Host: route.Host,
+						Port: route.Port,
+					},
+				},
+			}, nil
+		}
+	default:
+		return nil, &errors.RequestError{Msg: "Invalid route type"}
+	}
+}
+
 func (client *baseClient) executeCommandWithRoute(
 	requestType C.RequestType,
 	args []string,
@@ -136,13 +211,10 @@ func (client *baseClient) executeCommandWithRoute(
 		argLengthsPtr = &argLengths[0]
 	}
 
-	resultChannel := make(chan payload)
-	resultChannelPtr := uintptr(unsafe.Pointer(&resultChannel))
-
 	var routeBytesPtr *C.uchar = nil
 	var routeBytesCount C.uintptr_t = 0
 	if route != nil {
-		routeProto, err := route.ToRoutesProtobuf()
+		routeProto, err := routeToProtobuf(route)
 		if err != nil {
 			return nil, &errors.RequestError{Msg: "ExecuteCommand failed due to invalid route"}
 		}
@@ -155,9 +227,16 @@ func (client *baseClient) executeCommandWithRoute(
 		routeBytesPtr = (*C.uchar)(C.CBytes(msg))
 	}
 
+	resultChannel := make(chan payload)
+	resultChannelPtr := unsafe.Pointer(&resultChannel)
+
+	pinner := pinner{}
+	pinnedChannelPtr := uintptr(pinner.Pin(resultChannelPtr))
+	defer pinner.Unpin()
+
 	C.command(
 		client.coreClient,
-		C.uintptr_t(resultChannelPtr),
+		C.uintptr_t(pinnedChannelPtr),
 		uint32(requestType),
 		C.size_t(len(args)),
 		cArgsPtr,
@@ -232,8 +311,8 @@ func (client *baseClient) Set(key string, value string) (string, error) {
 //	If SetOptions.returnOldValue is set, return the old value as a String.
 //
 // [valkey.io]: https://valkey.io/commands/set/
-func (client *baseClient) SetWithOptions(key string, value string, options *SetOptions) (Result[string], error) {
-	optionArgs, err := options.toArgs()
+func (client *baseClient) SetWithOptions(key string, value string, options options.SetOptions) (Result[string], error) {
+	optionArgs, err := options.ToArgs()
 	if err != nil {
 		return CreateNilStringResult(), err
 	}
@@ -299,15 +378,15 @@ func (client *baseClient) GetEx(key string) (Result[string], error) {
 // Parameters:
 //
 //	key - The key to be retrieved from the database.
-//	options - The [api.GetExOptions].
+//	options - The [options.GetExOptions].
 //
 // Return value:
 //
 //	If key exists, returns the value of key as a Result[string]. Otherwise, return [api.CreateNilStringResult()].
 //
 // [valkey.io]: https://valkey.io/commands/getex/
-func (client *baseClient) GetExWithOptions(key string, options *GetExOptions) (Result[string], error) {
-	optionArgs, err := options.toArgs()
+func (client *baseClient) GetExWithOptions(key string, options options.GetExOptions) (Result[string], error) {
+	optionArgs, err := options.ToArgs()
 	if err != nil {
 		return CreateNilStringResult(), err
 	}
@@ -1028,7 +1107,7 @@ func (client *baseClient) HIncrByFloat(key string, field string, increment float
 func (client *baseClient) HScan(key string, cursor string) (string, []string, error) {
 	result, err := client.executeCommand(C.HScan, []string{key, cursor})
 	if err != nil {
-		return "", nil, err
+		return defaultStringResponse, nil, err
 	}
 	return handleScanResponse(result)
 }
@@ -1042,7 +1121,7 @@ func (client *baseClient) HScan(key string, cursor string) (string, []string, er
 //
 //	key - The key of the hash.
 //	cursor - The cursor that points to the next iteration of results. A value of "0" indicates the start of the search.
-//	options - The [api.HashScanOptions].
+//	options - The [options.HashScanOptions].
 //
 // Return value:
 //
@@ -1056,16 +1135,16 @@ func (client *baseClient) HScan(key string, cursor string) (string, []string, er
 func (client *baseClient) HScanWithOptions(
 	key string,
 	cursor string,
-	options *options.HashScanOptions,
+	options options.HashScanOptions,
 ) (string, []string, error) {
 	optionArgs, err := options.ToArgs()
 	if err != nil {
-		return "", nil, err
+		return defaultStringResponse, nil, err
 	}
 
 	result, err := client.executeCommand(C.HScan, append([]string{key, cursor}, optionArgs...))
 	if err != nil {
-		return "", nil, err
+		return defaultStringResponse, nil, err
 	}
 	return handleScanResponse(result)
 }
@@ -1147,7 +1226,7 @@ func (client *baseClient) HRandFieldWithCount(key string, count int64) ([]string
 //
 // [valkey.io]: https://valkey.io/commands/hrandfield/
 func (client *baseClient) HRandFieldWithCountWithValues(key string, count int64) ([][]string, error) {
-	result, err := client.executeCommand(C.HRandField, []string{key, utils.IntToString(count), options.WithValues})
+	result, err := client.executeCommand(C.HRandField, []string{key, utils.IntToString(count), options.WithValuesKeyword})
 	if err != nil {
 		return nil, err
 	}
@@ -1268,8 +1347,12 @@ func (client *baseClient) LPos(key string, element string) (Result[int64], error
 //	The Result[int64] containing the index of element, or [api.CreateNilInt64Result()] if element is not in the list.
 //
 // [valkey.io]: https://valkey.io/commands/lpos/
-func (client *baseClient) LPosWithOptions(key string, element string, options *LPosOptions) (Result[int64], error) {
-	result, err := client.executeCommand(C.LPos, append([]string{key, element}, options.toArgs()...))
+func (client *baseClient) LPosWithOptions(key string, element string, options options.LPosOptions) (Result[int64], error) {
+	optionArgs, err := options.ToArgs()
+	if err != nil {
+		return CreateNilInt64Result(), err
+	}
+	result, err := client.executeCommand(C.LPos, append([]string{key, element}, optionArgs...))
 	if err != nil {
 		return CreateNilInt64Result(), err
 	}
@@ -1293,7 +1376,7 @@ func (client *baseClient) LPosWithOptions(key string, element string, options *L
 //
 // [valkey.io]: https://valkey.io/commands/lpos/
 func (client *baseClient) LPosCount(key string, element string, count int64) ([]int64, error) {
-	result, err := client.executeCommand(C.LPos, []string{key, element, CountKeyword, utils.IntToString(count)})
+	result, err := client.executeCommand(C.LPos, []string{key, element, options.CountKeyword, utils.IntToString(count)})
 	if err != nil {
 		return nil, err
 	}
@@ -1311,7 +1394,7 @@ func (client *baseClient) LPosCount(key string, element string, count int64) ([]
 //	key     - The name of the list.
 //	element - The value to search for within the list.
 //	count   - The number of matches wanted.
-//	options - The LPos options.
+//	opts    - The LPos options.
 //
 // Return value:
 //
@@ -1322,11 +1405,15 @@ func (client *baseClient) LPosCountWithOptions(
 	key string,
 	element string,
 	count int64,
-	options *LPosOptions,
+	opts options.LPosOptions,
 ) ([]int64, error) {
+	optionArgs, err := opts.ToArgs()
+	if err != nil {
+		return nil, err
+	}
 	result, err := client.executeCommand(
 		C.LPos,
-		append([]string{key, element, CountKeyword, utils.IntToString(count)}, options.toArgs()...),
+		append([]string{key, element, options.CountKeyword, utils.IntToString(count)}, optionArgs...),
 	)
 	if err != nil {
 		return nil, err
@@ -1652,7 +1739,11 @@ func (client *baseClient) SInterCard(keys []string) (int64, error) {
 //
 // [valkey.io]: https://valkey.io/commands/sintercard/
 func (client *baseClient) SInterCardLimit(keys []string, limit int64) (int64, error) {
-	args := utils.Concat([]string{utils.IntToString(int64(len(keys)))}, keys, []string{"LIMIT", utils.IntToString(limit)})
+	args := utils.Concat(
+		[]string{utils.IntToString(int64(len(keys)))},
+		keys,
+		[]string{options.LimitKeyword, utils.IntToString(limit)},
+	)
 
 	result, err := client.executeCommand(C.SInterCard, args)
 	if err != nil {
@@ -1778,7 +1869,7 @@ func (client *baseClient) SUnion(keys []string) (map[string]struct{}, error) {
 func (client *baseClient) SScan(key string, cursor string) (string, []string, error) {
 	result, err := client.executeCommand(C.SScan, []string{key, cursor})
 	if err != nil {
-		return "", nil, err
+		return defaultStringResponse, nil, err
 	}
 	return handleScanResponse(result)
 }
@@ -1807,16 +1898,16 @@ func (client *baseClient) SScan(key string, cursor string) (string, []string, er
 func (client *baseClient) SScanWithOptions(
 	key string,
 	cursor string,
-	options *options.BaseScanOptions,
+	options options.BaseScanOptions,
 ) (string, []string, error) {
 	optionArgs, err := options.ToArgs()
 	if err != nil {
-		return "", nil, err
+		return defaultStringResponse, nil, err
 	}
 
 	result, err := client.executeCommand(C.SScan, append([]string{key, cursor}, optionArgs...))
 	if err != nil {
-		return "", nil, err
+		return defaultStringResponse, nil, err
 	}
 	return handleScanResponse(result)
 }
@@ -2042,7 +2133,7 @@ func (client *baseClient) RPopCount(key string, count int64) ([]string, error) {
 // Parameters:
 //
 //	key            - The key of the list.
-//	insertPosition - The relative position to insert into - either api.Before or api.After the pivot.
+//	insertPosition - The relative position to insert into - either options.Before or options.After the pivot.
 //	pivot          - An element of the list.
 //	element        - The new element to insert.
 //
@@ -2055,11 +2146,11 @@ func (client *baseClient) RPopCount(key string, count int64) ([]string, error) {
 // [valkey.io]: https://valkey.io/commands/linsert/
 func (client *baseClient) LInsert(
 	key string,
-	insertPosition InsertPosition,
+	insertPosition options.InsertPosition,
 	pivot string,
 	element string,
 ) (int64, error) {
-	insertPositionStr, err := insertPosition.toString()
+	insertPositionStr, err := insertPosition.ToString()
 	if err != nil {
 		return defaultIntResponse, err
 	}
@@ -2198,15 +2289,15 @@ func (client *baseClient) LPushX(key string, elements []string) (int64, error) {
 // Parameters:
 //
 //	keys          - An array of keys to lists.
-//	listDirection - The direction based on which elements are popped from - see [api.ListDirection].
+//	listDirection - The direction based on which elements are popped from - see [options.ListDirection].
 //
 // Return value:
 //
 //	A map of key name mapped array of popped element.
 //
 // [valkey.io]: https://valkey.io/commands/lmpop/
-func (client *baseClient) LMPop(keys []string, listDirection ListDirection) (map[string][]string, error) {
-	listDirectionStr, err := listDirection.toString()
+func (client *baseClient) LMPop(keys []string, listDirection options.ListDirection) (map[string][]string, error) {
+	listDirectionStr, err := listDirection.ToString()
 	if err != nil {
 		return nil, err
 	}
@@ -2240,7 +2331,7 @@ func (client *baseClient) LMPop(keys []string, listDirection ListDirection) (map
 // Parameters:
 //
 //	keys          - An array of keys to lists.
-//	listDirection - The direction based on which elements are popped from - see [api.ListDirection].
+//	listDirection - The direction based on which elements are popped from - see [options.ListDirection].
 //	count         - The maximum number of popped elements.
 //
 // Return value:
@@ -2250,10 +2341,10 @@ func (client *baseClient) LMPop(keys []string, listDirection ListDirection) (map
 // [valkey.io]: https://valkey.io/commands/lmpop/
 func (client *baseClient) LMPopCount(
 	keys []string,
-	listDirection ListDirection,
+	listDirection options.ListDirection,
 	count int64,
 ) (map[string][]string, error) {
-	listDirectionStr, err := listDirection.toString()
+	listDirectionStr, err := listDirection.ToString()
 	if err != nil {
 		return nil, err
 	}
@@ -2267,7 +2358,7 @@ func (client *baseClient) LMPopCount(
 	args := make([]string, 0, len(keys)+4)
 	args = append(args, strconv.Itoa(len(keys)))
 	args = append(args, keys...)
-	args = append(args, listDirectionStr, CountKeyword, utils.IntToString(count))
+	args = append(args, listDirectionStr, options.CountKeyword, utils.IntToString(count))
 	result, err := client.executeCommand(C.LMPop, args)
 	if err != nil {
 		return nil, err
@@ -2292,7 +2383,7 @@ func (client *baseClient) LMPopCount(
 // Parameters:
 //
 //	keys          - An array of keys to lists.
-//	listDirection - The direction based on which elements are popped from - see [api.ListDirection].
+//	listDirection - The direction based on which elements are popped from - see [options.ListDirection].
 //	timeoutSecs   - The number of seconds to wait for a blocking operation to complete. A value of 0 will block indefinitely.
 //
 // Return value:
@@ -2304,10 +2395,10 @@ func (client *baseClient) LMPopCount(
 // [Blocking Commands]: https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands
 func (client *baseClient) BLMPop(
 	keys []string,
-	listDirection ListDirection,
+	listDirection options.ListDirection,
 	timeoutSecs float64,
 ) (map[string][]string, error) {
-	listDirectionStr, err := listDirection.toString()
+	listDirectionStr, err := listDirection.ToString()
 	if err != nil {
 		return nil, err
 	}
@@ -2346,7 +2437,7 @@ func (client *baseClient) BLMPop(
 // Parameters:
 //
 //	keys          - An array of keys to lists.
-//	listDirection - The direction based on which elements are popped from - see [api.ListDirection].
+//	listDirection - The direction based on which elements are popped from - see [options.ListDirection].
 //	count         - The maximum number of popped elements.
 //	timeoutSecs   - The number of seconds to wait for a blocking operation to complete. A value of 0 will block
 //
@@ -2361,11 +2452,11 @@ func (client *baseClient) BLMPop(
 // [Blocking Commands]: https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands
 func (client *baseClient) BLMPopCount(
 	keys []string,
-	listDirection ListDirection,
+	listDirection options.ListDirection,
 	count int64,
 	timeoutSecs float64,
 ) (map[string][]string, error) {
-	listDirectionStr, err := listDirection.toString()
+	listDirectionStr, err := listDirection.ToString()
 	if err != nil {
 		return nil, err
 	}
@@ -2379,7 +2470,7 @@ func (client *baseClient) BLMPopCount(
 	args := make([]string, 0, len(keys)+5)
 	args = append(args, utils.FloatToString(timeoutSecs), strconv.Itoa(len(keys)))
 	args = append(args, keys...)
-	args = append(args, listDirectionStr, CountKeyword, utils.IntToString(count))
+	args = append(args, listDirectionStr, options.CountKeyword, utils.IntToString(count))
 	result, err := client.executeCommand(C.BLMPop, args)
 	if err != nil {
 		return nil, err
@@ -2435,14 +2526,14 @@ func (client *baseClient) LSet(key string, index int64, element string) (string,
 func (client *baseClient) LMove(
 	source string,
 	destination string,
-	whereFrom ListDirection,
-	whereTo ListDirection,
+	whereFrom options.ListDirection,
+	whereTo options.ListDirection,
 ) (Result[string], error) {
-	whereFromStr, err := whereFrom.toString()
+	whereFromStr, err := whereFrom.ToString()
 	if err != nil {
 		return CreateNilStringResult(), err
 	}
-	whereToStr, err := whereTo.toString()
+	whereToStr, err := whereTo.ToString()
 	if err != nil {
 		return CreateNilStringResult(), err
 	}
@@ -2488,15 +2579,15 @@ func (client *baseClient) LMove(
 func (client *baseClient) BLMove(
 	source string,
 	destination string,
-	whereFrom ListDirection,
-	whereTo ListDirection,
+	whereFrom options.ListDirection,
+	whereTo options.ListDirection,
 	timeoutSecs float64,
 ) (Result[string], error) {
-	whereFromStr, err := whereFrom.toString()
+	whereFromStr, err := whereFrom.ToString()
 	if err != nil {
 		return CreateNilStringResult(), err
 	}
-	whereToStr, err := whereTo.toString()
+	whereToStr, err := whereTo.ToString()
 	if err != nil {
 		return CreateNilStringResult(), err
 	}
@@ -2605,8 +2696,9 @@ func (client *baseClient) Expire(key string, seconds int64) (bool, error) {
 // Parameters:
 //
 //	key - The key to expire.
-//	seconds - Time in seconds for the key to expire
-//	option - The option  to set expiry - NX, XX, GT, LT
+//
+// seconds - Time in seconds for the key to expire.
+// option - The option to set expiry, see [options.ExpireCondition].
 //
 // Return value:
 //
@@ -2614,8 +2706,8 @@ func (client *baseClient) Expire(key string, seconds int64) (bool, error) {
 //	or operation skipped due to the provided arguments.
 //
 // [valkey.io]: https://valkey.io/commands/expire/
-func (client *baseClient) ExpireWithOptions(key string, seconds int64, expireCondition ExpireCondition) (bool, error) {
-	expireConditionStr, err := expireCondition.toString()
+func (client *baseClient) ExpireWithOptions(key string, seconds int64, expireCondition options.ExpireCondition) (bool, error) {
+	expireConditionStr, err := expireCondition.ToString()
 	if err != nil {
 		return defaultBoolResponse, err
 	}
@@ -2667,8 +2759,9 @@ func (client *baseClient) ExpireAt(key string, unixTimestampInSeconds int64) (bo
 // Parameters:
 //
 //	key - The key to expire.
-//	unixTimestampInSeconds - Absolute Unix timestamp
-//	option - The option  to set expiry - NX, XX, GT, LT
+//
+// unixTimestampInSeconds - Absolute Unix timestamp.
+// option - The option to set expiry - see [options.ExpireCondition].
 //
 // Return value:
 //
@@ -2679,9 +2772,9 @@ func (client *baseClient) ExpireAt(key string, unixTimestampInSeconds int64) (bo
 func (client *baseClient) ExpireAtWithOptions(
 	key string,
 	unixTimestampInSeconds int64,
-	expireCondition ExpireCondition,
+	expireCondition options.ExpireCondition,
 ) (bool, error) {
-	expireConditionStr, err := expireCondition.toString()
+	expireConditionStr, err := expireCondition.ToString()
 	if err != nil {
 		return defaultBoolResponse, err
 	}
@@ -2710,7 +2803,7 @@ func (client *baseClient) ExpireAtWithOptions(
 //	`true` if the timeout was set. `false` if the timeout was not set. e.g. key doesn't exist,
 //	or operation skipped due to the provided arguments.
 //
-//	[valkey.io]: https://valkey.io/commands/pexpire/
+// [valkey.io]: https://valkey.io/commands/pexpire/
 func (client *baseClient) PExpire(key string, milliseconds int64) (bool, error) {
 	result, err := client.executeCommand(C.PExpire, []string{key, utils.IntToString(milliseconds)})
 	if err != nil {
@@ -2728,20 +2821,20 @@ func (client *baseClient) PExpire(key string, milliseconds int64) (bool, error) 
 //
 //	key - The key to set timeout on it.
 //	milliseconds - The timeout in milliseconds.
-//	option - The option  to set expiry - NX, XX, GT, LT
+//	option - The option to set expiry, see [options.ExpireCondition].
 //
 // Return value:
 //
 //	`true` if the timeout was set. `false` if the timeout was not set. e.g. key doesn't exist,
 //	or operation skipped due to the provided arguments.
 //
-//	[valkey.io]: https://valkey.io/commands/pexpire/
+// [valkey.io]: https://valkey.io/commands/pexpire/
 func (client *baseClient) PExpireWithOptions(
 	key string,
 	milliseconds int64,
-	expireCondition ExpireCondition,
+	expireCondition options.ExpireCondition,
 ) (bool, error) {
-	expireConditionStr, err := expireCondition.toString()
+	expireConditionStr, err := expireCondition.ToString()
 	if err != nil {
 		return defaultBoolResponse, err
 	}
@@ -2770,7 +2863,7 @@ func (client *baseClient) PExpireWithOptions(
 //	`true` if the timeout was set. `false` if the timeout was not set. e.g. key doesn't exist,
 //	or operation skipped due to the provided arguments.
 //
-//	[valkey.io]: https://valkey.io/commands/pexpireat/
+// [valkey.io]: https://valkey.io/commands/pexpireat/
 func (client *baseClient) PExpireAt(key string, unixTimestampInMilliSeconds int64) (bool, error) {
 	result, err := client.executeCommand(C.PExpireAt, []string{key, utils.IntToString(unixTimestampInMilliSeconds)})
 	if err != nil {
@@ -2790,20 +2883,20 @@ func (client *baseClient) PExpireAt(key string, unixTimestampInMilliSeconds int6
 //
 //	key - The key to set timeout on it.
 //	unixMilliseconds - The timeout in an absolute Unix timestamp.
-//	option - The option  to set expiry - NX, XX, GT, LT
+//	option - The option to set expiry, see [options.ExpireCondition].
 //
 // Return value:
 //
 //	`true` if the timeout was set. `false` if the timeout was not set. e.g. key doesn't exist,
 //	or operation skipped due to the provided arguments.
 //
-//	[valkey.io]: https://valkey.io/commands/pexpireat/
+// [valkey.io]: https://valkey.io/commands/pexpireat/
 func (client *baseClient) PExpireAtWithOptions(
 	key string,
 	unixTimestampInMilliSeconds int64,
-	expireCondition ExpireCondition,
+	expireCondition options.ExpireCondition,
 ) (bool, error) {
-	expireConditionStr, err := expireCondition.toString()
+	expireConditionStr, err := expireCondition.ToString()
 	if err != nil {
 		return defaultBoolResponse, err
 	}
@@ -3000,7 +3093,7 @@ func (client *baseClient) Unlink(keys []string) (int64, error) {
 //
 //	If the key exists, the type of the stored value is returned. Otherwise, a "none" string is returned.
 //
-// [valkey.io]: Https://valkey.io/commands/type/
+// [valkey.io]: https://valkey.io/commands/type/
 func (client *baseClient) Type(key string) (string, error) {
 	result, err := client.executeCommand(C.Type, []string{key})
 	if err != nil {
@@ -3103,7 +3196,7 @@ func (client *baseClient) RenameNX(key string, newKey string) (bool, error) {
 //
 // [valkey.io]: https://valkey.io/commands/xadd/
 func (client *baseClient) XAdd(key string, values [][]string) (Result[string], error) {
-	return client.XAddWithOptions(key, values, options.NewXAddOptions())
+	return client.XAddWithOptions(key, values, *options.NewXAddOptions())
 }
 
 // Adds an entry to the specified stream stored at `key`. If the `key` doesn't exist, the stream is created.
@@ -3124,7 +3217,7 @@ func (client *baseClient) XAdd(key string, values [][]string) (Result[string], e
 func (client *baseClient) XAddWithOptions(
 	key string,
 	values [][]string,
-	options *options.XAddOptions,
+	options options.XAddOptions,
 ) (Result[string], error) {
 	args := []string{}
 	args = append(args, key)
@@ -3169,7 +3262,7 @@ func (client *baseClient) XAddWithOptions(
 //
 // [valkey.io]: https://valkey.io/commands/xread/
 func (client *baseClient) XRead(keysAndIds map[string]string) (map[string]map[string][][]string, error) {
-	return client.XReadWithOptions(keysAndIds, options.NewXReadOptions())
+	return client.XReadWithOptions(keysAndIds, *options.NewXReadOptions())
 }
 
 // Reads entries from the given streams.
@@ -3183,7 +3276,7 @@ func (client *baseClient) XRead(keysAndIds map[string]string) (map[string]map[st
 // Parameters:
 //
 //	keysAndIds - A map of keys and entry IDs to read from.
-//	options - Options detailing how to read the stream.
+//	opts - Options detailing how to read the stream.
 //
 // Return value:
 //
@@ -3193,22 +3286,12 @@ func (client *baseClient) XRead(keysAndIds map[string]string) (map[string]map[st
 // [valkey.io]: https://valkey.io/commands/xread/
 func (client *baseClient) XReadWithOptions(
 	keysAndIds map[string]string,
-	options *options.XReadOptions,
+	opts options.XReadOptions,
 ) (map[string]map[string][][]string, error) {
-	args := make([]string, 0, 5+2*len(keysAndIds))
-	optionArgs, _ := options.ToArgs()
-	args = append(args, optionArgs...)
-
-	// Note: this loop iterates in an indeterminate order, but it is OK for that case
-	keys := make([]string, 0, len(keysAndIds))
-	values := make([]string, 0, len(keysAndIds))
-	for key := range keysAndIds {
-		keys = append(keys, key)
-		values = append(values, keysAndIds[key])
+	args, err := createStreamCommandArgs(make([]string, 0, 5+2*len(keysAndIds)), keysAndIds, &opts)
+	if err != nil {
+		return nil, err
 	}
-	args = append(args, "STREAMS")
-	args = append(args, keys...)
-	args = append(args, values...)
 
 	result, err := client.executeCommand(C.XRead, args)
 	if err != nil {
@@ -3243,7 +3326,7 @@ func (client *baseClient) XReadGroup(
 	consumer string,
 	keysAndIds map[string]string,
 ) (map[string]map[string][][]string, error) {
-	return client.XReadGroupWithOptions(group, consumer, keysAndIds, options.NewXReadGroupOptions())
+	return client.XReadGroupWithOptions(group, consumer, keysAndIds, *options.NewXReadGroupOptions())
 }
 
 // Reads entries from the given streams owned by a consumer group.
@@ -3259,7 +3342,7 @@ func (client *baseClient) XReadGroup(
 //	group - The consumer group name.
 //	consumer - The group consumer.
 //	keysAndIds - A map of keys and entry IDs to read from.
-//	options - Options detailing how to read the stream.
+//	opts - Options detailing how to read the stream.
 //
 // Return value:
 //
@@ -3271,9 +3354,9 @@ func (client *baseClient) XReadGroupWithOptions(
 	group string,
 	consumer string,
 	keysAndIds map[string]string,
-	options *options.XReadGroupOptions,
+	opts options.XReadGroupOptions,
 ) (map[string]map[string][][]string, error) {
-	args, err := createStreamCommandArgs([]string{"GROUP", group, consumer}, keysAndIds, options)
+	args, err := createStreamCommandArgs([]string{options.GroupKeyword, group, consumer}, keysAndIds, &opts)
 	if err != nil {
 		return nil, err
 	}
@@ -3290,9 +3373,9 @@ func (client *baseClient) XReadGroupWithOptions(
 func createStreamCommandArgs(
 	args []string,
 	keysAndIds map[string]string,
-	options interface{ ToArgs() ([]string, error) },
+	opts interface{ ToArgs() ([]string, error) },
 ) ([]string, error) {
-	optionArgs, err := options.ToArgs()
+	optionArgs, err := opts.ToArgs()
 	if err != nil {
 		return nil, err
 	}
@@ -3304,7 +3387,7 @@ func createStreamCommandArgs(
 		keys = append(keys, key)
 		values = append(values, keysAndIds[key])
 	}
-	args = append(args, "STREAMS")
+	args = append(args, options.StreamsKeyword)
 	args = append(args, keys...)
 	args = append(args, values...)
 	return args, nil
@@ -3357,7 +3440,7 @@ func (client *baseClient) ZAdd(
 func (client *baseClient) ZAddWithOptions(
 	key string,
 	membersScoreMap map[string]float64,
-	opts *options.ZAddOptions,
+	opts options.ZAddOptions,
 ) (int64, error) {
 	optionArgs, err := opts.ToArgs()
 	if err != nil {
@@ -3409,7 +3492,7 @@ func (client *baseClient) ZAddIncr(
 	member string,
 	increment float64,
 ) (Result[float64], error) {
-	options, err := options.NewZAddOptionsBuilder().SetIncr(true, increment, member)
+	options, err := options.NewZAddOptions().SetIncr(true, increment, member)
 	if err != nil {
 		return CreateNilFloat64Result(), err
 	}
@@ -3438,7 +3521,7 @@ func (client *baseClient) ZAddIncrWithOptions(
 	key string,
 	member string,
 	increment float64,
-	opts *options.ZAddOptions,
+	opts options.ZAddOptions,
 ) (Result[float64], error) {
 	incrOpts, err := opts.SetIncr(true, increment, member)
 	if err != nil {
@@ -3516,8 +3599,12 @@ func (client *baseClient) ZPopMin(key string) (map[string]float64, error) {
 //	command returns an empty map.
 //
 // [valkey.io]: https://valkey.io/commands/zpopmin/
-func (client *baseClient) ZPopMinWithCount(key string, count int64) (map[string]float64, error) {
-	result, err := client.executeCommand(C.ZPopMin, []string{key, utils.IntToString(count)})
+func (client *baseClient) ZPopMinWithOptions(key string, options options.ZPopOptions) (map[string]float64, error) {
+	optArgs, err := options.ToArgs()
+	if err != nil {
+		return nil, err
+	}
+	result, err := client.executeCommand(C.ZPopMin, append([]string{key}, optArgs...))
 	if err != nil {
 		return nil, err
 	}
@@ -3565,8 +3652,12 @@ func (client *baseClient) ZPopMax(key string) (map[string]float64, error) {
 //	command returns an empty map.
 //
 // [valkey.io]: https://valkey.io/commands/zpopmin/
-func (client *baseClient) ZPopMaxWithCount(key string, count int64) (map[string]float64, error) {
-	result, err := client.executeCommand(C.ZPopMax, []string{key, utils.IntToString(count)})
+func (client *baseClient) ZPopMaxWithOptions(key string, options options.ZPopOptions) (map[string]float64, error) {
+	optArgs, err := options.ToArgs()
+	if err != nil {
+		return nil, err
+	}
+	result, err := client.executeCommand(C.ZPopMax, append([]string{key}, optArgs...))
 	if err != nil {
 		return nil, err
 	}
@@ -3672,7 +3763,7 @@ func (client *baseClient) BZPopMin(keys []string, timeoutSecs float64) (Result[K
 // Parameters:
 //
 //	keys          - An array of keys to lists.
-//	scoreFilter   - The element pop criteria - either [api.MIN] or [api.MAX] to pop members with the lowest/highest
+//	scoreFilter   - The element pop criteria - either [options.MIN] or [options.MAX] to pop members with the lowest/highest
 //					scores accordingly.
 //	timeoutSecs   - The number of seconds to wait for a blocking operation to complete. A value of `0` will block
 //					indefinitely.
@@ -3688,10 +3779,10 @@ func (client *baseClient) BZPopMin(keys []string, timeoutSecs float64) (Result[K
 // [Blocking Commands]: https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands
 func (client *baseClient) BZMPop(
 	keys []string,
-	scoreFilter ScoreFilter,
+	scoreFilter options.ScoreFilter,
 	timeoutSecs float64,
 ) (Result[KeyWithArrayOfMembersAndScores], error) {
-	scoreFilterStr, err := scoreFilter.toString()
+	scoreFilterStr, err := scoreFilter.ToString()
 	if err != nil {
 		return CreateNilKeyWithArrayOfMembersAndScoresResult(), err
 	}
@@ -3732,10 +3823,12 @@ func (client *baseClient) BZMPop(
 // Parameters:
 //
 //	keys          - An array of keys to lists.
-//	scoreFilter   - The element pop criteria - either [api.MIN] or [api.MAX] to pop members with the lowest/highest
+//	scoreFilter   - The element pop criteria - either [options.MIN] or [options.MAX] to pop members with the lowest/highest
 //					scores accordingly.
 //	count         - The maximum number of popped elements.
 //	timeoutSecs   - The number of seconds to wait for a blocking operation to complete. A value of `0` will block indefinitely.
+//
+//	opts          - Pop options, see [options.ZMPopOptions].
 //
 // Return value:
 //
@@ -3748,11 +3841,11 @@ func (client *baseClient) BZMPop(
 // [Blocking Commands]: https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands
 func (client *baseClient) BZMPopWithOptions(
 	keys []string,
-	scoreFilter ScoreFilter,
+	scoreFilter options.ScoreFilter,
 	timeoutSecs float64,
-	opts *options.ZMPopOptions,
+	opts options.ZMPopOptions,
 ) (Result[KeyWithArrayOfMembersAndScores], error) {
-	scoreFilterStr, err := scoreFilter.toString()
+	scoreFilterStr, err := scoreFilter.ToString()
 	if err != nil {
 		return CreateNilKeyWithArrayOfMembersAndScoresResult(), err
 	}
@@ -3769,13 +3862,11 @@ func (client *baseClient) BZMPopWithOptions(
 	args = append(args, utils.FloatToString(timeoutSecs), strconv.Itoa(len(keys)))
 	args = append(args, keys...)
 	args = append(args, scoreFilterStr)
-	if opts != nil {
-		optionArgs, err := opts.ToArgs()
-		if err != nil {
-			return CreateNilKeyWithArrayOfMembersAndScoresResult(), err
-		}
-		args = append(args, optionArgs...)
+	optionArgs, err := opts.ToArgs()
+	if err != nil {
+		return CreateNilKeyWithArrayOfMembersAndScoresResult(), err
 	}
+	args = append(args, optionArgs...)
 	result, err := client.executeCommand(C.BZMPop, args)
 	if err != nil {
 		return CreateNilKeyWithArrayOfMembersAndScoresResult(), err
@@ -3808,7 +3899,11 @@ func (client *baseClient) BZMPopWithOptions(
 func (client *baseClient) ZRange(key string, rangeQuery options.ZRangeQuery) ([]string, error) {
 	args := make([]string, 0, 10)
 	args = append(args, key)
-	args = append(args, rangeQuery.ToArgs()...)
+	queryArgs, err := rangeQuery.ToArgs()
+	if err != nil {
+		return nil, err
+	}
+	args = append(args, queryArgs...)
 	result, err := client.executeCommand(C.ZRange, args)
 	if err != nil {
 		return nil, err
@@ -3841,8 +3936,12 @@ func (client *baseClient) ZRangeWithScores(
 ) (map[string]float64, error) {
 	args := make([]string, 0, 10)
 	args = append(args, key)
-	args = append(args, rangeQuery.ToArgs()...)
-	args = append(args, "WITHSCORES")
+	queryArgs, err := rangeQuery.ToArgs()
+	if err != nil {
+		return nil, err
+	}
+	args = append(args, queryArgs...)
+	args = append(args, options.WithScoresKeyword)
 	result, err := client.executeCommand(C.ZRange, args)
 	if err != nil {
 		return nil, err
@@ -3883,7 +3982,11 @@ func (client *baseClient) ZRangeStore(
 	args := make([]string, 0, 10)
 	args = append(args, destination)
 	args = append(args, key)
-	args = append(args, rangeQuery.ToArgs()...)
+	rqArgs, err := rangeQuery.ToArgs()
+	if err != nil {
+		return defaultIntResponse, err
+	}
+	args = append(args, rqArgs...)
 	result, err := client.executeCommand(C.ZRangeStore, args)
 	if err != nil {
 		return defaultIntResponse, err
@@ -3928,7 +4031,7 @@ func (client *baseClient) Persist(key string) (bool, error) {
 //	The number of members in the specified score range.
 //
 // [valkey.io]: https://valkey.io/commands/zcount/
-func (client *baseClient) ZCount(key string, rangeOptions *options.ZCountRange) (int64, error) {
+func (client *baseClient) ZCount(key string, rangeOptions options.ZCountRange) (int64, error) {
 	zCountRangeArgs, err := rangeOptions.ToArgs()
 	if err != nil {
 		return defaultIntResponse, err
@@ -3984,7 +4087,7 @@ func (client *baseClient) ZRank(key string, member string) (Result[int64], error
 //
 // [valkey.io]: https://valkey.io/commands/zrank/
 func (client *baseClient) ZRankWithScore(key string, member string) (Result[int64], Result[float64], error) {
-	result, err := client.executeCommand(C.ZRank, []string{key, member, options.WithScore})
+	result, err := client.executeCommand(C.ZRank, []string{key, member, options.WithScoreKeyword})
 	if err != nil {
 		return CreateNilInt64Result(), CreateNilFloat64Result(), err
 	}
@@ -4037,7 +4140,7 @@ func (client *baseClient) ZRevRank(key string, member string) (Result[int64], er
 //
 // [valkey.io]: https://valkey.io/commands/zrevrank/
 func (client *baseClient) ZRevRankWithScore(key string, member string) (Result[int64], Result[float64], error) {
-	result, err := client.executeCommand(C.ZRevRank, []string{key, member, options.WithScore})
+	result, err := client.executeCommand(C.ZRevRank, []string{key, member, options.WithScoreKeyword})
 	if err != nil {
 		return CreateNilInt64Result(), CreateNilFloat64Result(), err
 	}
@@ -4058,7 +4161,7 @@ func (client *baseClient) ZRevRankWithScore(key string, member string) (Result[i
 //	The number of entries deleted from the stream.
 //
 // [valkey.io]: https://valkey.io/commands/xtrim/
-func (client *baseClient) XTrim(key string, options *options.XTrimOptions) (int64, error) {
+func (client *baseClient) XTrim(key string, options options.XTrimOptions) (int64, error) {
 	xTrimArgs, err := options.ToArgs()
 	if err != nil {
 		return defaultIntResponse, err
@@ -4126,7 +4229,7 @@ func (client *baseClient) XAutoClaim(
 	minIdleTime int64,
 	start string,
 ) (XAutoClaimResponse, error) {
-	return client.XAutoClaimWithOptions(key, group, consumer, minIdleTime, start, nil)
+	return client.XAutoClaimWithOptions(key, group, consumer, minIdleTime, start, *options.NewXAutoClaimOptions())
 }
 
 // Transfers ownership of pending stream entries that match the specified criteria.
@@ -4164,16 +4267,14 @@ func (client *baseClient) XAutoClaimWithOptions(
 	consumer string,
 	minIdleTime int64,
 	start string,
-	options *options.XAutoClaimOptions,
+	options options.XAutoClaimOptions,
 ) (XAutoClaimResponse, error) {
 	args := []string{key, group, consumer, utils.IntToString(minIdleTime), start}
-	if options != nil {
-		optArgs, err := options.ToArgs()
-		if err != nil {
-			return XAutoClaimResponse{}, err
-		}
-		args = append(args, optArgs...)
+	optArgs, err := options.ToArgs()
+	if err != nil {
+		return XAutoClaimResponse{}, err
 	}
+	args = append(args, optArgs...)
 	result, err := client.executeCommand(C.XAutoClaim, args)
 	if err != nil {
 		return XAutoClaimResponse{}, err
@@ -4216,7 +4317,7 @@ func (client *baseClient) XAutoClaimJustId(
 	minIdleTime int64,
 	start string,
 ) (XAutoClaimJustIdResponse, error) {
-	return client.XAutoClaimJustIdWithOptions(key, group, consumer, minIdleTime, start, nil)
+	return client.XAutoClaimJustIdWithOptions(key, group, consumer, minIdleTime, start, *options.NewXAutoClaimOptions())
 }
 
 // Transfers ownership of pending stream entries that match the specified criteria.
@@ -4234,7 +4335,7 @@ func (client *baseClient) XAutoClaimJustId(
 //	consumer - The group consumer.
 //	minIdleTime - The minimum idle time for the message to be claimed.
 //	start - Filters the claimed entries to those that have an ID equal or greater than the specified value.
-//	options - Options detailing how to read the stream.
+//	opts - Options detailing how to read the stream.
 //
 // Return value:
 //
@@ -4254,17 +4355,15 @@ func (client *baseClient) XAutoClaimJustIdWithOptions(
 	consumer string,
 	minIdleTime int64,
 	start string,
-	options *options.XAutoClaimOptions,
+	opts options.XAutoClaimOptions,
 ) (XAutoClaimJustIdResponse, error) {
 	args := []string{key, group, consumer, utils.IntToString(minIdleTime), start}
-	if options != nil {
-		optArgs, err := options.ToArgs()
-		if err != nil {
-			return XAutoClaimJustIdResponse{}, err
-		}
-		args = append(args, optArgs...)
+	optArgs, err := opts.ToArgs()
+	if err != nil {
+		return XAutoClaimJustIdResponse{}, err
 	}
-	args = append(args, "JUSTID")
+	args = append(args, optArgs...)
+	args = append(args, options.JustIdKeyword)
 	result, err := client.executeCommand(C.XAutoClaim, args)
 	if err != nil {
 		return XAutoClaimJustIdResponse{}, err
@@ -4340,7 +4439,7 @@ func (client *baseClient) ZScore(key string, member string) (Result[float64], er
 func (client *baseClient) ZScan(key string, cursor string) (string, []string, error) {
 	result, err := client.executeCommand(C.ZScan, []string{key, cursor})
 	if err != nil {
-		return "", nil, err
+		return defaultStringResponse, nil, err
 	}
 	return handleScanResponse(result)
 }
@@ -4361,22 +4460,22 @@ func (client *baseClient) ZScan(key string, cursor string) (string, []string, er
 //	   returned on the last iteration of the sorted set.
 //	The second return value is always an array of the subset of the sorted set held in `key`.
 //	The array is a flattened series of `string` pairs, where the value is at even indices and the score is at odd indices.
-//	If `ZScanOptionsBuilder#noScores` is to `true`, the second return value will only contain the members without scores.
+//	If [ZScanOptions.noScores] is to `true`, the second return value will only contain the members without scores.
 //
 // [valkey.io]: https://valkey.io/commands/zscan/
 func (client *baseClient) ZScanWithOptions(
 	key string,
 	cursor string,
-	options *options.ZScanOptions,
+	options options.ZScanOptions,
 ) (string, []string, error) {
 	optionArgs, err := options.ToArgs()
 	if err != nil {
-		return "", nil, err
+		return defaultStringResponse, nil, err
 	}
 
 	result, err := client.executeCommand(C.ZScan, append([]string{key, cursor}, optionArgs...))
 	if err != nil {
-		return "", nil, err
+		return defaultStringResponse, nil, err
 	}
 	return handleScanResponse(result)
 }
@@ -4434,7 +4533,7 @@ func (client *baseClient) XPending(key string, group string) (XPendingSummary, e
 func (client *baseClient) XPendingWithOptions(
 	key string,
 	group string,
-	opts *options.XPendingOptions,
+	opts options.XPendingOptions,
 ) ([]XPendingDetail, error) {
 	optionArgs, _ := opts.ToArgs()
 	args := append([]string{key, group}, optionArgs...)
@@ -4463,7 +4562,7 @@ func (client *baseClient) XPendingWithOptions(
 //
 // [valkey.io]: https://valkey.io/commands/xgroup-create/
 func (client *baseClient) XGroupCreate(key string, group string, id string) (string, error) {
-	return client.XGroupCreateWithOptions(key, group, id, options.NewXGroupCreateOptions())
+	return client.XGroupCreateWithOptions(key, group, id, *options.NewXGroupCreateOptions())
 }
 
 // Creates a new consumer group uniquely identified by `group` for the stream stored at `key`.
@@ -4487,7 +4586,7 @@ func (client *baseClient) XGroupCreateWithOptions(
 	key string,
 	group string,
 	id string,
-	opts *options.XGroupCreateOptions,
+	opts options.XGroupCreateOptions,
 ) (string, error) {
 	optionArgs, _ := opts.ToArgs()
 	args := append([]string{key, group, id}, optionArgs...)
@@ -4513,7 +4612,7 @@ func (client *baseClient) XGroupCreateWithOptions(
 //
 // [valkey.io]: https://valkey.io/commands/restore/
 func (client *baseClient) Restore(key string, ttl int64, value string) (Result[string], error) {
-	return client.RestoreWithOptions(key, ttl, value, NewRestoreOptionsBuilder())
+	return client.RestoreWithOptions(key, ttl, value, *options.NewRestoreOptions())
 }
 
 // Create a key associated with a value that is obtained by
@@ -4524,7 +4623,7 @@ func (client *baseClient) Restore(key string, ttl int64, value string) (Result[s
 //	key - The key to create.
 //	ttl - The expiry time (in milliseconds). If 0, the key will persist.
 //	value - The serialized value to deserialize and assign to key.
-//	restoreOptions - Set restore options with replace and absolute TTL modifiers, object idletime and frequency
+//	restoreOptions - Set restore options with replace and absolute TTL modifiers, object idletime and frequency.
 //
 // Return value:
 //
@@ -4532,9 +4631,9 @@ func (client *baseClient) Restore(key string, ttl int64, value string) (Result[s
 //
 // [valkey.io]: https://valkey.io/commands/restore/
 func (client *baseClient) RestoreWithOptions(key string, ttl int64,
-	value string, options *RestoreOptions,
+	value string, options options.RestoreOptions,
 ) (Result[string], error) {
-	optionArgs, err := options.toArgs()
+	optionArgs, err := options.ToArgs()
 	if err != nil {
 		return CreateNilStringResult(), err
 	}
@@ -4556,7 +4655,7 @@ func (client *baseClient) RestoreWithOptions(key string, ttl int64,
 //
 // Return value:
 //
-//	The serialized value of the data stored at key
+//	The serialized value of the data stored at key.
 //	If key does not exist, null will be returned.
 //
 // [valkey.io]: https://valkey.io/commands/dump/
@@ -4581,7 +4680,7 @@ func (client *baseClient) Dump(key string) (Result[string], error) {
 // Return value:
 //
 //	If key exists, returns the internal encoding of the object stored at
-//	key as a String. Otherwise, returns null.
+//	key as a String. Otherwise, returns `null`.
 //
 // [valkey.io]: https://valkey.io/commands/object-encoding/
 func (client *baseClient) ObjectEncoding(key string) (Result[string], error) {
@@ -4650,7 +4749,7 @@ func (client *baseClient) XGroupDestroy(key string, group string) (bool, error) 
 //
 // [valkey.io]: https://valkey.io/commands/xgroup-setid/
 func (client *baseClient) XGroupSetId(key string, group string, id string) (string, error) {
-	return client.XGroupSetIdWithOptions(key, group, id, options.NewXGroupSetIdOptionsOptions())
+	return client.XGroupSetIdWithOptions(key, group, id, *options.NewXGroupSetIdOptionsOptions())
 }
 
 // Sets the last delivered ID for a consumer group.
@@ -4673,7 +4772,7 @@ func (client *baseClient) XGroupSetIdWithOptions(
 	key string,
 	group string,
 	id string,
-	opts *options.XGroupSetIdOptions,
+	opts options.XGroupSetIdOptions,
 ) (string, error) {
 	optionArgs, _ := opts.ToArgs()
 	args := append([]string{key, group, id}, optionArgs...)
@@ -4702,8 +4801,12 @@ func (client *baseClient) XGroupSetIdWithOptions(
 //
 // [valkey.io]: https://valkey.io/commands/zremrangebylex/
 func (client *baseClient) ZRemRangeByLex(key string, rangeQuery options.RangeByLex) (int64, error) {
+	queryArgs, err := rangeQuery.ToArgsRemRange()
+	if err != nil {
+		return defaultIntResponse, err
+	}
 	result, err := client.executeCommand(
-		C.ZRemRangeByLex, append([]string{key}, rangeQuery.ToArgsRemRange()...))
+		C.ZRemRangeByLex, append([]string{key}, queryArgs...))
 	if err != nil {
 		return defaultIntResponse, err
 	}
@@ -4730,7 +4833,7 @@ func (client *baseClient) ZRemRangeByLex(key string, rangeQuery options.RangeByL
 func (client *baseClient) ZRemRangeByRank(key string, start int64, stop int64) (int64, error) {
 	result, err := client.executeCommand(C.ZRemRangeByRank, []string{key, utils.IntToString(start), utils.IntToString(stop)})
 	if err != nil {
-		return 0, err
+		return defaultIntResponse, err
 	}
 	return handleIntResponse(result)
 }
@@ -4753,9 +4856,13 @@ func (client *baseClient) ZRemRangeByRank(key string, start int64, stop int64) (
 //
 // [valkey.io]: https://valkey.io/commands/zremrangebyscore/
 func (client *baseClient) ZRemRangeByScore(key string, rangeQuery options.RangeByScore) (int64, error) {
-	result, err := client.executeCommand(C.ZRemRangeByScore, append([]string{key}, rangeQuery.ToArgsRemRange()...))
+	queryArgs, err := rangeQuery.ToArgsRemRange()
 	if err != nil {
-		return 0, err
+		return defaultIntResponse, err
+	}
+	result, err := client.executeCommand(C.ZRemRangeByScore, append([]string{key}, queryArgs...))
+	if err != nil {
+		return defaultIntResponse, err
 	}
 	return handleIntResponse(result)
 }
@@ -4823,7 +4930,7 @@ func (client *baseClient) ZRandMemberWithCount(key string, count int64) ([]strin
 //
 // [valkey.io]: https://valkey.io/commands/zrandmember/
 func (client *baseClient) ZRandMemberWithCountWithScores(key string, count int64) ([]MemberAndScore, error) {
-	result, err := client.executeCommand(C.ZRandMember, []string{key, utils.IntToString(count), options.WithScores})
+	result, err := client.executeCommand(C.ZRandMember, []string{key, utils.IntToString(count), options.WithScoresKeyword})
 	if err != nil {
 		return nil, err
 	}
@@ -4962,8 +5069,11 @@ func (client *baseClient) Sort(key string) ([]Result[string], error) {
 //	An Array of sorted elements.
 //
 // [valkey.io]: https://valkey.io/commands/sort/
-func (client *baseClient) SortWithOptions(key string, options *options.SortOptions) ([]Result[string], error) {
-	optionArgs := options.ToArgs()
+func (client *baseClient) SortWithOptions(key string, options options.SortOptions) ([]Result[string], error) {
+	optionArgs, err := options.ToArgs()
+	if err != nil {
+		return nil, err
+	}
 	result, err := client.executeCommand(C.Sort, append([]string{key}, optionArgs...))
 	if err != nil {
 		return nil, err
@@ -5019,8 +5129,11 @@ func (client *baseClient) SortReadOnly(key string) ([]Result[string], error) {
 //	An Array of sorted elements.
 //
 // [valkey.io]: https://valkey.io/commands/sort_ro/
-func (client *baseClient) SortReadOnlyWithOptions(key string, options *options.SortOptions) ([]Result[string], error) {
-	optionArgs := options.ToArgs()
+func (client *baseClient) SortReadOnlyWithOptions(key string, options options.SortOptions) ([]Result[string], error) {
+	optionArgs, err := options.ToArgs()
+	if err != nil {
+		return nil, err
+	}
 	result, err := client.executeCommand(C.SortReadOnly, append([]string{key}, optionArgs...))
 	if err != nil {
 		return nil, err
@@ -5055,7 +5168,7 @@ func (client *baseClient) SortReadOnlyWithOptions(key string, options *options.S
 //
 // [valkey.io]: https://valkey.io/commands/sort/
 func (client *baseClient) SortStore(key string, destination string) (int64, error) {
-	result, err := client.executeCommand(C.Sort, []string{key, "STORE", destination})
+	result, err := client.executeCommand(C.Sort, []string{key, options.StoreKeyword, destination})
 	if err != nil {
 		return defaultIntResponse, err
 	}
@@ -5084,7 +5197,8 @@ func (client *baseClient) SortStore(key string, destination string) (int64, erro
 //
 //	key - The key of the list, set, or sorted set to be sorted.
 //	destination - The key where the sorted result will be stored.
-//	sortOptions - The SortOptions type.
+//
+// opts - The [options.SortOptions] type.
 //
 // Return value:
 //
@@ -5094,10 +5208,13 @@ func (client *baseClient) SortStore(key string, destination string) (int64, erro
 func (client *baseClient) SortStoreWithOptions(
 	key string,
 	destination string,
-	options *options.SortOptions,
+	opts options.SortOptions,
 ) (int64, error) {
-	optionArgs := options.ToArgs()
-	result, err := client.executeCommand(C.Sort, append([]string{key, "STORE", destination}, optionArgs...))
+	optionArgs, err := opts.ToArgs()
+	if err != nil {
+		return defaultIntResponse, err
+	}
+	result, err := client.executeCommand(C.Sort, append([]string{key, options.StoreKeyword, destination}, optionArgs...))
 	if err != nil {
 		return defaultIntResponse, err
 	}
@@ -5293,7 +5410,7 @@ func (client *baseClient) BitCount(key string) (int64, error) {
 //	Returns zero if the key is missing as it is treated as an empty string.
 //
 // [valkey.io]: https://valkey.io/commands/bitcount/
-func (client *baseClient) BitCountWithOptions(key string, opts *options.BitCountOptions) (int64, error) {
+func (client *baseClient) BitCountWithOptions(key string, opts options.BitCountOptions) (int64, error) {
 	optionArgs, err := opts.ToArgs()
 	if err != nil {
 		return defaultIntResponse, err
@@ -5331,7 +5448,7 @@ func (client *baseClient) XClaim(
 	minIdleTime int64,
 	ids []string,
 ) (map[string][][]string, error) {
-	return client.XClaimWithOptions(key, group, consumer, minIdleTime, ids, nil)
+	return client.XClaimWithOptions(key, group, consumer, minIdleTime, ids, *options.NewXClaimOptions())
 }
 
 // Changes the ownership of a pending message.
@@ -5359,16 +5476,14 @@ func (client *baseClient) XClaimWithOptions(
 	consumer string,
 	minIdleTime int64,
 	ids []string,
-	opts *options.StreamClaimOptions,
+	opts options.XClaimOptions,
 ) (map[string][][]string, error) {
 	args := append([]string{key, group, consumer, utils.IntToString(minIdleTime)}, ids...)
-	if opts != nil {
-		optionArgs, err := opts.ToArgs()
-		if err != nil {
-			return nil, err
-		}
-		args = append(args, optionArgs...)
+	optionArgs, err := opts.ToArgs()
+	if err != nil {
+		return nil, err
 	}
+	args = append(args, optionArgs...)
 	result, err := client.executeCommand(C.XClaim, args)
 	if err != nil {
 		return nil, err
@@ -5402,7 +5517,7 @@ func (client *baseClient) XClaimJustId(
 	minIdleTime int64,
 	ids []string,
 ) ([]string, error) {
-	return client.XClaimJustIdWithOptions(key, group, consumer, minIdleTime, ids, nil)
+	return client.XClaimJustIdWithOptions(key, group, consumer, minIdleTime, ids, *options.NewXClaimOptions())
 }
 
 // Changes the ownership of a pending message. This function returns an `array` with
@@ -5430,17 +5545,15 @@ func (client *baseClient) XClaimJustIdWithOptions(
 	consumer string,
 	minIdleTime int64,
 	ids []string,
-	opts *options.StreamClaimOptions,
+	opts options.XClaimOptions,
 ) ([]string, error) {
 	args := append([]string{key, group, consumer, utils.IntToString(minIdleTime)}, ids...)
-	if opts != nil {
-		optionArgs, err := opts.ToArgs()
-		if err != nil {
-			return nil, err
-		}
-		args = append(args, optionArgs...)
+	optionArgs, err := opts.ToArgs()
+	if err != nil {
+		return nil, err
 	}
-	args = append(args, options.JUST_ID_VALKEY_API)
+	args = append(args, optionArgs...)
+	args = append(args, options.JustIdKeyword)
 	result, err := client.executeCommand(C.XClaim, args)
 	if err != nil {
 		return nil, err
@@ -5495,9 +5608,9 @@ func (client *baseClient) Copy(source string, destination string) (bool, error) 
 func (client *baseClient) CopyWithOptions(
 	source string,
 	destination string,
-	options *CopyOptions,
+	options options.CopyOptions,
 ) (bool, error) {
-	optionArgs, err := options.toArgs()
+	optionArgs, err := options.ToArgs()
 	if err != nil {
 		return defaultBoolResponse, err
 	}
@@ -5538,7 +5651,7 @@ func (client *baseClient) XRange(
 	start options.StreamBoundary,
 	end options.StreamBoundary,
 ) ([]XRangeResponse, error) {
-	return client.XRangeWithOptions(key, start, end, nil)
+	return client.XRangeWithOptions(key, start, end, *options.NewXRangeOptions())
 }
 
 // Returns stream entries matching a given range of IDs.
@@ -5566,16 +5679,14 @@ func (client *baseClient) XRangeWithOptions(
 	key string,
 	start options.StreamBoundary,
 	end options.StreamBoundary,
-	opts *options.StreamRangeOptions,
+	opts options.XRangeOptions,
 ) ([]XRangeResponse, error) {
 	args := []string{key, string(start), string(end)}
-	if opts != nil {
-		optionArgs, err := opts.ToArgs()
-		if err != nil {
-			return nil, err
-		}
-		args = append(args, optionArgs...)
+	optionArgs, err := opts.ToArgs()
+	if err != nil {
+		return nil, err
 	}
+	args = append(args, optionArgs...)
 	result, err := client.executeCommand(C.XRange, args)
 	if err != nil {
 		return nil, err
@@ -5609,7 +5720,7 @@ func (client *baseClient) XRevRange(
 	start options.StreamBoundary,
 	end options.StreamBoundary,
 ) ([]XRangeResponse, error) {
-	return client.XRevRangeWithOptions(key, start, end, nil)
+	return client.XRevRangeWithOptions(key, start, end, *options.NewXRangeOptions())
 }
 
 // Returns stream entries matching a given range of IDs in reverse order.
@@ -5639,16 +5750,14 @@ func (client *baseClient) XRevRangeWithOptions(
 	key string,
 	start options.StreamBoundary,
 	end options.StreamBoundary,
-	opts *options.StreamRangeOptions,
+	opts options.XRangeOptions,
 ) ([]XRangeResponse, error) {
 	args := []string{key, string(start), string(end)}
-	if opts != nil {
-		optionArgs, err := opts.ToArgs()
-		if err != nil {
-			return nil, err
-		}
-		args = append(args, optionArgs...)
+	optionArgs, err := opts.ToArgs()
+	if err != nil {
+		return nil, err
 	}
+	args = append(args, optionArgs...)
 	result, err := client.executeCommand(C.XRevRange, args)
 	if err != nil {
 		return nil, err
@@ -5708,6 +5817,52 @@ func (client *baseClient) XInfoStreamFullWithOptions(
 		return nil, err
 	}
 	return handleStringToAnyMapResponse(result)
+}
+
+// Returns the list of all consumers and their attributes for the given consumer group of the
+// stream stored at `key`.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	key   - The key of the stream.
+//	group - The consumer group name.
+//
+// Return value:
+//
+//	An array of [api.XInfoConsumerInfo], where each element contains the attributes
+//	of a consumer for the given consumer group of the stream at `key`.
+//
+// [valkey.io]: https://valkey.io/commands/xinfo-consumers/
+func (client *baseClient) XInfoConsumers(key string, group string) ([]XInfoConsumerInfo, error) {
+	response, err := client.executeCommand(C.XInfoConsumers, []string{key, group})
+	if err != nil {
+		return nil, err
+	}
+	return handleXInfoConsumersResponse(response)
+}
+
+// Returns the list of all consumer groups and their attributes for the stream stored at `key`.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	key - The key of the stream.
+//
+// Return value:
+//
+//	An array of [api.XInfoGroupInfo], where each element represents the
+//	attributes of a consumer group for the stream at `key`.
+//
+// [valkey.io]: https://valkey.io/commands/xinfo-groups/
+func (client *baseClient) XInfoGroups(key string) ([]XInfoGroupInfo, error) {
+	response, err := client.executeCommand(C.XInfoGroups, []string{key})
+	if err != nil {
+		return nil, err
+	}
+	return handleXInfoGroupsResponse(response)
 }
 
 // Reads or modifies the array of bits representing the string that is held at key
@@ -5832,7 +5987,10 @@ func (client *baseClient) Time() ([]string, error) {
 //
 // [valkey.io]: https://valkey.io/commands/zinter/
 func (client *baseClient) ZInter(keys options.KeyArray) ([]string, error) {
-	args := keys.ToArgs()
+	args, err := keys.ToArgs()
+	if err != nil {
+		return nil, err
+	}
 	result, err := client.executeCommand(C.ZInter, args)
 	if err != nil {
 		return nil, err
@@ -5865,15 +6023,18 @@ func (client *baseClient) ZInter(keys options.KeyArray) ([]string, error) {
 // [valkey.io]: https://valkey.io/commands/zinter/
 func (client *baseClient) ZInterWithScores(
 	keysOrWeightedKeys options.KeysOrWeightedKeys,
-	zInterOptions *options.ZInterOptions,
+	zInterOptions options.ZInterOptions,
 ) (map[string]float64, error) {
-	args := keysOrWeightedKeys.ToArgs()
+	args, err := keysOrWeightedKeys.ToArgs()
+	if err != nil {
+		return nil, err
+	}
 	optionsArgs, err := zInterOptions.ToArgs()
 	if err != nil {
 		return nil, err
 	}
 	args = append(args, optionsArgs...)
-	args = append(args, options.WithScores)
+	args = append(args, options.WithScoresKeyword)
 	result, err := client.executeCommand(C.ZInter, args)
 	if err != nil {
 		return nil, err
@@ -5881,10 +6042,85 @@ func (client *baseClient) ZInterWithScores(
 	return handleStringDoubleMapResponse(result)
 }
 
+// Computes the intersection of sorted sets given by the specified `keysOrWeightedKeys`
+// and stores the result in `destination`. If `destination` already exists, it is overwritten.
+// Otherwise, a new sorted set will be created.
+//
+// Note:
+//
+//	When in cluster mode, all keys must map to the same hash slot.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	destination - The destination key for the result.
+//	keysOrWeightedKeys - The keys or weighted keys of the sorted sets, see - [options.KeysOrWeightedKeys].
+//	                   - Use `options.NewKeyArray()` for keys only.
+//	                   - Use `options.NewWeightedKeys()` for weighted keys with score multipliers.
+//
+// Return value:
+//
+//	The number of elements in the resulting sorted set stored at `destination`.
+//
+// [valkey.io]: https://valkey.io/commands/zinterstore/
+func (client *baseClient) ZInterStore(destination string, keysOrWeightedKeys options.KeysOrWeightedKeys) (int64, error) {
+	return client.ZInterStoreWithOptions(destination, keysOrWeightedKeys, *options.NewZInterOptions())
+}
+
+// Computes the intersection of sorted sets given by the specified `keysOrWeightedKeys`
+// and stores the result in `destination`. If `destination` already exists, it is overwritten.
+// Otherwise, a new sorted set will be created.
+//
+// Note:
+//
+//	When in cluster mode, all keys must map to the same hash slot.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	destination - The destination key for the result.
+//	keysOrWeightedKeys - The keys or weighted keys of the sorted sets, see - [options.KeysOrWeightedKeys].
+//	                     - Use `options.NewKeyArray()` for keys only.
+//	                     - Use `options.NewWeightedKeys()` for weighted keys with score multipliers.
+//	options   - The options for the ZInterStore command, see - [options.ZInterOptions].
+//	           Optional `aggregate` option specifies the aggregation strategy to apply when combining the scores of
+//	           elements.
+//
+// Return value:
+//
+//	The number of elements in the resulting sorted set stored at `destination`.
+//
+// [valkey.io]: https://valkey.io/commands/zinterstore/
+func (client *baseClient) ZInterStoreWithOptions(
+	destination string,
+	keysOrWeightedKeys options.KeysOrWeightedKeys,
+	zInterOptions options.ZInterOptions,
+) (int64, error) {
+	args, err := keysOrWeightedKeys.ToArgs()
+	if err != nil {
+		return defaultIntResponse, err
+	}
+	args = append([]string{destination}, args...)
+	optionsArgs, err := zInterOptions.ToArgs()
+	if err != nil {
+		return defaultIntResponse, err
+	}
+	args = append(args, optionsArgs...)
+	result, err := client.executeCommand(C.ZInterStore, args)
+	if err != nil {
+		return defaultIntResponse, err
+	}
+	return handleIntResponse(result)
+}
+
 // Returns the difference between the first sorted set and all the successive sorted sets.
 // To get the elements with their scores, see `ZDiffWithScores`
 //
-// When in cluster mode, all `keys` must map to the same hash slot.
+// Note:
+//
+//	When in cluster mode, all `keys` must map to the same hash slot.
 //
 // Available for Valkey 6.2 and above.
 //
@@ -5930,7 +6166,7 @@ func (client *baseClient) ZDiff(keys []string) ([]string, error) {
 func (client *baseClient) ZDiffWithScores(keys []string) (map[string]float64, error) {
 	args := append([]string{}, strconv.Itoa(len(keys)))
 	args = append(args, keys...)
-	result, err := client.executeCommand(C.ZDiff, append(args, options.WithScores))
+	result, err := client.executeCommand(C.ZDiff, append(args, options.WithScoresKeyword))
 	if err != nil {
 		return nil, err
 	}
@@ -5941,7 +6177,9 @@ func (client *baseClient) ZDiffWithScores(keys []string) (map[string]float64, er
 // `keys` and stores the difference as a sorted set to `destination`,
 // overwriting it if it already exists. Non-existent keys are treated as empty sets.
 //
-// Note: When in cluster mode, `destination` and all `keys` must map to the same hash slot.
+// Note:
+//
+//	When in cluster mode, `destination` and all `keys` must map to the same hash slot.
 //
 // Available for Valkey 6.2 and above.
 //
@@ -5962,77 +6200,6 @@ func (client *baseClient) ZDiffStore(destination string, keys []string) (int64, 
 		C.ZDiffStore,
 		append([]string{destination, strconv.Itoa(len(keys))}, keys...),
 	)
-	if err != nil {
-		return defaultIntResponse, err
-	}
-	return handleIntResponse(result)
-}
-
-// Computes the intersection of sorted sets given by the specified `keysOrWeightedKeys`
-// and stores the result in `destination`. If `destination` already exists, it is overwritten.
-// Otherwise, a new sorted set will be created.
-//
-// Note:
-//
-//	When in cluster mode, all keys must map to the same hash slot.
-//
-// See [valkey.io] for details.
-//
-// Parameters:
-//
-//	destination - The destination key for the result.
-//	keysOrWeightedKeys - The keys or weighted keys of the sorted sets, see - [options.KeysOrWeightedKeys].
-//	                   - Use `options.NewKeyArray()` for keys only.
-//	                   - Use `options.NewWeightedKeys()` for weighted keys with score multipliers.
-//
-// Return value:
-//
-//	The number of elements in the resulting sorted set stored at <code>destination</code>.
-//
-// [valkey.io]: https://valkey.io/commands/zinterstore/
-func (client *baseClient) ZInterStore(destination string, keysOrWeightedKeys options.KeysOrWeightedKeys) (int64, error) {
-	return client.ZInterStoreWithOptions(destination, keysOrWeightedKeys, nil)
-}
-
-// Computes the intersection of sorted sets given by the specified `keysOrWeightedKeys`
-// and stores the result in `destination`. If `destination` already exists, it is overwritten.
-// Otherwise, a new sorted set will be created.
-//
-// Note:
-//
-//	When in cluster mode, all keys must map to the same hash slot.
-//
-// See [valkey.io] for details.
-//
-// Parameters:
-//
-//	destination - The destination key for the result.
-//	keysOrWeightedKeys - The keys or weighted keys of the sorted sets, see - [options.KeysOrWeightedKeys].
-//	                     - Use `options.NewKeyArray()` for keys only.
-//	                     - Use `options.NewWeightedKeys()` for weighted keys with score multipliers.
-//	options   - The options for the ZInterStore command, see - [options.ZInterOptions].
-//	           Optional `aggregate` option specifies the aggregation strategy to apply when combining the scores of
-//	           elements.
-//
-// Return value:
-//
-//	The number of elements in the resulting sorted set stored at <code>destination</code>.
-//
-// [valkey.io]: https://valkey.io/commands/zinterstore/
-func (client *baseClient) ZInterStoreWithOptions(
-	destination string,
-	keysOrWeightedKeys options.KeysOrWeightedKeys,
-	zInterOptions *options.ZInterOptions,
-) (int64, error) {
-	args := append([]string{destination}, keysOrWeightedKeys.ToArgs()...)
-	if zInterOptions != nil {
-		optionsArgs, err := zInterOptions.ToArgs()
-		if err != nil {
-			return defaultIntResponse, err
-		}
-		args = append(args, optionsArgs...)
-	}
-	result, err := client.executeCommand(C.ZInterStore, args)
 	if err != nil {
 		return defaultIntResponse, err
 	}
@@ -6060,7 +6227,10 @@ func (client *baseClient) ZInterStoreWithOptions(
 //
 // [valkey.io]: https://valkey.io/commands/zunion/
 func (client *baseClient) ZUnion(keys options.KeyArray) ([]string, error) {
-	args := keys.ToArgs()
+	args, err := keys.ToArgs()
+	if err != nil {
+		return nil, err
+	}
 	result, err := client.executeCommand(C.ZUnion, args)
 	if err != nil {
 		return nil, err
@@ -6095,13 +6265,16 @@ func (client *baseClient) ZUnionWithScores(
 	keysOrWeightedKeys options.KeysOrWeightedKeys,
 	zUnionOptions *options.ZUnionOptions,
 ) (map[string]float64, error) {
-	args := keysOrWeightedKeys.ToArgs()
+	args, err := keysOrWeightedKeys.ToArgs()
+	if err != nil {
+		return nil, err
+	}
 	optionsArgs, err := zUnionOptions.ToArgs()
 	if err != nil {
 		return nil, err
 	}
 	args = append(args, optionsArgs...)
-	args = append(args, options.WithScores)
+	args = append(args, options.WithScoresKeyword)
 	result, err := client.executeCommand(C.ZUnion, args)
 	if err != nil {
 		return nil, err
@@ -6169,7 +6342,11 @@ func (client *baseClient) ZUnionStoreWithOptions(
 	keysOrWeightedKeys options.KeysOrWeightedKeys,
 	zUnionOptions *options.ZUnionOptions,
 ) (int64, error) {
-	args := append([]string{destination}, keysOrWeightedKeys.ToArgs()...)
+	keysArgs, err := keysOrWeightedKeys.ToArgs()
+	if err != nil {
+		return defaultIntResponse, err
+	}
+	args := append([]string{destination}, keysArgs...)
 	if zUnionOptions != nil {
 		optionsArgs, err := zUnionOptions.ToArgs()
 		if err != nil {
@@ -6178,6 +6355,81 @@ func (client *baseClient) ZUnionStoreWithOptions(
 		args = append(args, optionsArgs...)
 	}
 	result, err := client.executeCommand(C.ZUnionStore, args)
+	if err != nil {
+		return defaultIntResponse, err
+	}
+	return handleIntResponse(result)
+}
+
+// Returns the cardinality of the intersection of the sorted sets specified by `keys`.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	keys - The keys of the sorted sets.
+//
+// Return value:
+//
+//	The cardinality of the intersection of the sorted sets.
+//
+// [valkey.io]: https://valkey.io/commands/zintercard/
+func (client *baseClient) ZInterCard(keys []string) (int64, error) {
+	return client.ZInterCardWithOptions(keys, nil)
+}
+
+// Returns the cardinality of the intersection of the sorted sets specified by `keys`.
+// If the intersection cardinality reaches `options.limit` partway through the computation, the
+// algorithm will exit early and yield `options.limit` as the cardinality.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	keys - The keys of the sorted sets.
+//	options - The options for the ZInterCard command, see - [options.ZInterCardOptions].
+//
+// Return value:
+//
+//	The cardinality of the intersection of the sorted sets.
+//
+// [valkey.io]: https://valkey.io/commands/zintercard/
+func (client *baseClient) ZInterCardWithOptions(keys []string, options *options.ZInterCardOptions) (int64, error) {
+	args := append([]string{strconv.Itoa(len(keys))}, keys...)
+	if options != nil {
+		optionsArgs, err := options.ToArgs()
+		if err != nil {
+			return defaultIntResponse, err
+		}
+		args = append(args, optionsArgs...)
+	}
+	result, err := client.executeCommand(C.ZInterCard, args)
+	if err != nil {
+		return defaultIntResponse, err
+	}
+	return handleIntResponse(result)
+}
+
+// Returns the number of elements in the sorted set at key with a value between min and max.
+//
+// Available for Valkey 6.2 and above.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	key - The key of the sorted set.
+//	rangeQuery - The range query to apply to the sorted set.
+//
+// Return value:
+//
+//	The number of elements in the sorted set at key with a value between min and max.
+//
+// [valkey.io]: https://valkey.io/commands/zlexcount/
+func (client *baseClient) ZLexCount(key string, rangeQuery *options.RangeByLex) (int64, error) {
+	args := []string{key}
+	args = append(args, rangeQuery.ToArgsLexCount()...)
+	result, err := client.executeCommand(C.ZLexCount, args)
 	if err != nil {
 		return defaultIntResponse, err
 	}

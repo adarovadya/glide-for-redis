@@ -1,3 +1,5 @@
+// Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
+
 package api
 
 import (
@@ -28,8 +30,8 @@ func ExampleGlideClusterClient_Info() {
 func ExampleGlideClusterClient_InfoWithOptions() {
 	var client *GlideClusterClient = getExampleGlideClusterClient() // example helper function
 
-	opts := ClusterInfoOptions{
-		InfoOptions: &InfoOptions{Sections: []Section{Cluster}},
+	opts := options.ClusterInfoOptions{
+		InfoOptions: &options.InfoOptions{Sections: []options.Section{options.Cluster}},
 	}
 
 	response, err := client.InfoWithOptions(opts)
