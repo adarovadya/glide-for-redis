@@ -13,6 +13,8 @@ import {
     GlideClusterClient,
     GlideString,
     Logger,
+    OpenTelemetry,
+    OpenTelemetryConfig,
 } from "valkey-glide";
 import {
     generateKeyGet,
@@ -305,6 +307,18 @@ async function main(
             clusterModeEnabled,
         );
     }
+
+    const openTelemetryConfig: OpenTelemetryConfig = {
+        traces: {
+            endpoint: "file://./traces10.json",
+            samplePercentage: 10,
+        },
+        metrics: {
+            endpoint: "file://./metrics.json",
+        },
+        flushIntervalMs: 1000,
+    };
+    OpenTelemetry.init(openTelemetryConfig);
 }
 
 const numberOfIterations = (numOfConcurrentTasks: number) =>
